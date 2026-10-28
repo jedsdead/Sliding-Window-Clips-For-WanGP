@@ -8,6 +8,8 @@ This module replaces two WanGP functions (WanGP looks them up by name each time,
 * save_video: when it is called by the generator with that per-window list, only the newest window is encoded, into
   outputs/window_clips/<generation>/w01.mp4, w02.mp4... Played back to back the clips are the normal output, frame for
   frame (the overlap frames are already cut off by WanGP).
+  Continue Video: WanGP puts the whole Source Video in front of the first window. That part is saved as its own clip,
+  w00, so w01 onwards hold only the new frames (also when the continuation fits in one window).
 * combine_and_concatenate_video_with_audio_tracks: the audio added to a clip is cut to that clip's time span (newer
   WanGP versions keep a little audio past the last frame, audio_tail_seconds: that is left to the joined video).
 If the generation is aborted, the finished windows are joined into its latest output file the same way (the gallery
@@ -15,7 +17,7 @@ shows it). After the last window, the clips are joined into the normal output fi
 way WanGP does it), or, with joining off, the last clip is copied there. Before that, each window's normal output
 file is a copy of its clip, so the gallery, the metadata and "keep intermediate sliding windows" work as usual.
 
-Anything else is left to WanGP: single-window generations, HDR, and soundtrack generators that need the whole video
+Anything else is left to WanGP: single-window generations (unless continuing a Source Video), HDR, and soundtrack generators that need the whole video
 (MMAudio...). If a clip or the join fails, WanGP's own full encode is used for that file.
 """
 
@@ -65,6 +67,15 @@ def _is_last_window(local):
     if local.get("stop_current_sample"):  # Early Stop: this window ends the video
         return True
     return int(local.get("window_no") or 0) >= int(local.get("total_windows") or 0) and not gen.get("extra_windows", 0)
+
+
+def _source_frames(local, chunks):
+    """Continue Video: number of Source Video frames WanGP put in front of the first window (0 if none).
+    Not split with frame interpolation, which changes the frame count after the Source Video is added."""
+    if len(chunks) != 1 or local.get("video_source") is None or local.get("temporal_upsampling"):
+        return 0
+    count = int(local.get("source_video_frames_count") or 0)
+    return count if 1 < count < int(chunks[0].shape[1]) else 0
 
 
 def _run_for(local, chunks, container):
@@ -170,31 +181,49 @@ def _wrap_save_video(original):
                 or local.get("any_soundtrack_processor") or local.get("sample_is_hdr")):
             return original(*args, **kwargs)
         last = _is_last_window(local)
-        if len(tensor) == 1 and last:  # a single window: nothing to split
+        source = _source_frames(local, tensor)  # Continue Video: the Source Video part of the first window
+        if len(tensor) == 1 and last and not source:  # a single window: nothing to split
             return original(*args, **kwargs)
         save_file = kwargs.get("save_file", args[1] if len(args) > 1 else None)
         container = kwargs.get("container", "mp4")
         fps = kwargs.get("fps", 30)
         options = {key: value for key, value in kwargs.items() if key not in ("tensor", "save_file")}
+        audio_next = save_file is not None and save_file == local.get("save_path_tmp")
+        source_clip = source_video = None
         try:
             run, clip_path = _run_for(local, tensor, container)
-            original(tensor=[tensor[-1]], save_file=clip_path, **options)
+            if source:
+                source_clip = os.path.join(run["folder"], f"w00.{container}")
+                # With audio added next, the clip is made from this video file by the audio step
+                source_video = os.path.join(run["folder"], f"w00_video.{container}") if audio_next else source_clip
+                original(tensor=[tensor[0][:, :source]], save_file=source_video, **options)
+                original(tensor=[tensor[0][:, source:]], save_file=clip_path, **options)
+                with _lock:
+                    _run["source"] = True
+            else:
+                original(tensor=[tensor[-1]], save_file=clip_path, **options)
         except Exception as error:
             print(f"{LOG_PREFIX} could not save the window as a clip, WanGP saves the whole video: {error!r}")
             return original(*args, **kwargs)
-        frames_before = sum(int(chunk.shape[1]) for chunk in tensor[:-1])
+        frames_before = sum(int(chunk.shape[1]) for chunk in tensor[:-1]) + source
         window = len(tensor)
-        print(f"{LOG_PREFIX} window {window} saved as {os.path.relpath(clip_path, os.path.dirname(os.path.dirname(run['folder'])))}")
+        folder_root = os.path.dirname(os.path.dirname(run['folder']))
+        if source:
+            print(f"{LOG_PREFIX} source video saved as {os.path.relpath(source_clip, folder_root)}")
+        print(f"{LOG_PREFIX} window {window} saved as {os.path.relpath(clip_path, folder_root)}")
 
-        if save_file is not None and save_file == local.get("save_path_tmp"):
+        if audio_next:
             # Audio is added next (combine_and_concatenate_video_with_audio_tracks): it builds the clip from this file
             shutil.move(clip_path, save_file)
             with _lock:
                 _pending[os.path.abspath(save_file)] = dict(clip=clip_path, start=frames_before / fps,
-                                                            duration=int(tensor[-1].shape[1]) / fps, last=last,
-                                                            frames=tensor, options=options, window=window)
+                                                            duration=(int(tensor[-1].shape[1]) - source) / fps, last=last,
+                                                            frames=tensor, options=options, window=window,
+                                                            source=dict(clip=source_clip, video=source_video) if source else None)
             return save_file
 
+        if source:
+            _clip_done(source_clip, False, save_file)
         clips = _clip_done(clip_path, last, save_file)
         if last and settings.get()["join"]:
             if _concat(clips, save_file):
@@ -223,6 +252,20 @@ def _wrap_combine(original, save_video_original):
                             audio_sampling_rate, *args, **kwargs)
         folder = os.path.dirname(clip["clip"])
         new_audio_from_start = kwargs.get("new_audio_from_start", args[0] if args else False)
+        source = clip.get("source")
+        if source:  # Continue Video: the Source Video clip starts the video, so it gets WanGP's audio as is
+            try:
+                first_kwargs = {key: value for key, value in kwargs.items() if key != "audio_tail_seconds"}
+                original(source["clip"], source["video"], source_audio_tracks, new_audio_tracks, source_audio_duration,
+                         audio_sampling_rate, *args, **first_kwargs)
+            except Exception as error:
+                print(f"{LOG_PREFIX} could not add the audio to the source video clip: {error!r}")
+                if not os.path.isfile(source["clip"]):
+                    shutil.copyfile(source["video"], source["clip"])
+            finally:
+                if os.path.isfile(source["video"]):
+                    os.remove(source["video"])
+            _clip_done(source["clip"], False, save_path_tmp)
         temporary = []
         try:
             if clip["start"] <= 0:  # the first window starts the video: WanGP's audio as is, cut at the clip's end
@@ -357,7 +400,8 @@ def finish_interrupted():
             metadata = read_metadata_from_video(output)
         except Exception:
             pass
-        window_copy = _keep_last_window(output, len(clips), run.get("gen"), metadata)
+        windows = len(clips) - (1 if run.get("source") else 0)  # w00, the Source Video, is not a window
+        window_copy = _keep_last_window(output, windows, run.get("gen"), metadata)
         os.replace(joined, output)
         if metadata:
             try:
@@ -365,8 +409,9 @@ def finish_interrupted():
                 save_video_metadata(output, metadata)
             except Exception as error:
                 print(f"{LOG_PREFIX} the joined video has no WanGP metadata: {error!r}")
-        print(f"{LOG_PREFIX} generation stopped: the {len(clips)} finished windows were joined into {os.path.basename(output)}"
-              + (f" (window {len(clips)} on its own: {os.path.basename(window_copy)})" if window_copy else ""))
+        print(f"{LOG_PREFIX} generation stopped: {windows} finished window{'s' if windows != 1 else ''}"
+              + (" and the source video" if run.get("source") else "") + f" were joined into {os.path.basename(output)}"
+              + (f" (window {windows} on its own: {os.path.basename(window_copy)})" if window_copy else ""))
     except Exception as error:
         print(f"{LOG_PREFIX} could not join the finished windows: {error!r}")
     finally:

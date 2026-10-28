@@ -1,8 +1,8 @@
 {
     "name": "Sliding Window Clips",
     "author": "Jedsdeadbaby",
-    "version": "0.1",
+    "version": "0.2",
     "description": "Saves each sliding window as its own clip instead of re-encoding the whole video after every window, and joins the clips at the end without re-encoding.",
-    "date": "2026-10-20",
+    "date": "2026-10-28",
     "wan2gp_version": ""
 }

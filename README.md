@@ -13,12 +13,16 @@ saves stay fast however long the video gets.
   re-encoding, which takes seconds. Untick **Also join them at the end** to skip it (the output is then only the
   last window; the clips are all in the folder).
 
+**Continue Video**: the source video is saved as its own clip, `w00.mp4`, so `w01.mp4` onwards hold only the new
+part, and the joined video is the source plus the new windows. This works even when the continuation fits in one
+window. (With frame interpolation on, the source stays inside `w01.mp4`.)
+
 With Wan2GP's *Keep intermediate sliding windows* setting on, the gallery shows every window on its own, the last
 one included (saved next to the joined video as `..._w13.mp4`), then the joined video.
 
 Both options are in the **Sliding Window** tab of the generation page.
 
-Generations with a single window are left to Wan2GP, and so are HDR outputs and soundtrack generators that need the
+Generations with a single window (other than Continue Video) are left to Wan2GP, and so are HDR outputs and soundtrack generators that need the
 whole video (MMAudio...). Early Stop and Abort work too: the windows finished so far are joined, and the gallery
 shows that video.
 

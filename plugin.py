@@ -20,7 +20,7 @@ class SlidingWindowClipsPlugin(WAN2GPPlugin):
     def __init__(self):
         super().__init__()
         self.name = "Sliding Window Clips"
-        self.version = "0.1"
+        self.version = "0.2"
         self.description = ("Saves each sliding window as its own clip instead of re-encoding the whole video after every "
                             "window, and joins the clips at the end without re-encoding.")
         self._ui_built = False
